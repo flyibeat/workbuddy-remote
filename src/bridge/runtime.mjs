@@ -491,7 +491,48 @@ class CdpClient {
           });
         }
 
-        const bridgeVersion = 4;
+        if (!globalThis.__workbuddyRemoteDaemon) {
+          globalThis.__workbuddyRemoteDaemon = {
+            ports: new Map(),
+            setup(socketId, port) {
+              const previous = this.ports.get(socketId);
+              if (previous) {
+                try { previous.close(); } catch {}
+                this.ports.delete(socketId);
+              }
+              this.ports.set(socketId, port);
+              port.onmessage = (event) => {
+                try {
+                  globalThis.workbuddyBridgeNotify(JSON.stringify({
+                    type: "daemon-frame",
+                    socketId,
+                    data: event.data,
+                  }));
+                } catch (error) {
+                  console.warn("[workbuddy-remote] daemon frame notify failed", error);
+                }
+              };
+              try { port.start(); } catch {}
+              return true;
+            },
+            recv(socketId, raw) {
+              const port = this.ports.get(socketId);
+              if (!port) {
+                return false;
+              }
+              port.postMessage(JSON.parse(raw));
+              return true;
+            },
+            close(socketId) {
+              const port = this.ports.get(socketId);
+              this.ports.delete(socketId);
+              try { port?.close(); } catch {}
+              return true;
+            },
+          };
+        }
+
+        const bridgeVersion = 7;
         if (
           globalThis.__workbuddyBridge?.__workbuddyRemoteNativeOnly &&
           globalThis.__workbuddyBridge.__workbuddyRemoteVersion >= bridgeVersion
@@ -576,6 +617,7 @@ class CdpClient {
         };
 
         const buddyApiListeners = new Map();
+        const wbEventListeners = new Map();
         const storedArgs = new Map();
         const storedResults = new Map();
         const storedSessionHistories = new Map();
@@ -933,6 +975,64 @@ class CdpClient {
             buddyApiListeners.delete(key);
             return true;
           },
+
+          async callWbInvoke(channel, context, args) {
+            if (typeof globalThis.__wbInvoke !== "function") {
+              throw new Error("WorkBuddy desktop preload bridge is unavailable");
+            }
+            return makeChunkedResult(
+              encode(await globalThis.__wbInvoke(channel, context, ...decode(args || [])))
+            );
+          },
+
+          subscribeWbEvent(channel) {
+            const key = "wbOn:" + channel;
+            if (wbEventListeners.has(key)) {
+              return true;
+            }
+            if (typeof globalThis.__wbOn !== "function") {
+              throw new Error("WorkBuddy desktop preload bridge is unavailable");
+            }
+            const listener = (...payload) => {
+              notify({ type: "wb-event", channel, args: payload.map((item) => encode(item)) });
+            };
+            const dispose = globalThis.__wbOn(channel, listener);
+            wbEventListeners.set(key, dispose || true);
+            return true;
+          },
+
+          unsubscribeWbEvent(channel) {
+            const key = "wbOn:" + channel;
+            const entry = wbEventListeners.get(key);
+            if (!entry) {
+              return true;
+            }
+            try {
+              if (typeof entry === "function") {
+                entry();
+              }
+            } catch {}
+            wbEventListeners.delete(key);
+            return true;
+          },
+
+          registerWbEventBridge() {
+            if (typeof globalThis.__wbEventBridge !== "function") {
+              return false;
+            }
+            if (globalThis.__workbuddyBridgeWbEventBridgeActive) {
+              return true;
+            }
+            globalThis.__workbuddyBridgeWbEventBridgeActive = true;
+            globalThis.__wbEventBridge((event, payload) => {
+              try {
+                notify({ type: "wb-event-all", event, args: [encode(payload)] });
+              } catch (error) {
+                console.warn("[workbuddy-remote] wb event bridge notify failed", error);
+              }
+            });
+            return true;
+          },
         };
 
         return "ok";
@@ -1054,6 +1154,10 @@ class BridgeRuntime {
     this.warmupPromise = null;
     this.hideWindowAfterStartAttempted = false;
     this.inFlightBuddyApiCalls = new Map();
+    this.daemonSockets = new Map();
+    this.daemonSocketSeq = 0;
+    this.wbEventRefCounts = new Map();
+    this.wbEventSocketSubs = new Map();
   }
 
   async initialize() {
@@ -1150,6 +1254,13 @@ class BridgeRuntime {
       await this.cdp.connect();
       await this.cdp.ensureBridgeInjected();
       this.hostBridgeKind = await this.cdp.evaluate(`globalThis.__workbuddyBridge.getHostKind()`);
+      try {
+        await this.cdp.evaluate(`globalThis.__workbuddyBridge.registerWbEventBridge()`);
+      } catch (error) {
+        logger.warn("wb_event_bridge.register_error", "Failed to register wb event bridge in WorkBuddy", {
+          error,
+        });
+      }
       this.lastTargetCheckAt = Date.now();
       this.targetUrl = target.url;
       await this.restoreBuddyApiSubscriptions();
@@ -1265,6 +1376,12 @@ class BridgeRuntime {
       this.browserSockets.delete(socket);
       this.releaseSocketSubscriptions(socket).catch((error) => {
         logger.warn("buddy_api.subscription.cleanup_error", "Failed to clean up browser subscriptions", {
+          socketId,
+          error,
+        });
+      });
+      this.releaseWbEventSocket(socket).catch((error) => {
+        logger.warn("wb_event.subscription.cleanup_error", "Failed to clean up browser wb-event subscriptions", {
           socketId,
           error,
         });
@@ -2005,6 +2122,156 @@ class BridgeRuntime {
     };
   }
 
+  async handleDaemonSocket(socket) {
+    await this.ensureCdpReady();
+    const socketId = ++this.daemonSocketSeq;
+    this.daemonSockets.set(socketId, socket);
+    logger.info("daemon_transport.socket.opened", "Browser daemon transport socket opened", {
+      socketId,
+      daemonSocketCount: this.daemonSockets.size,
+    });
+
+    try {
+      await this.withCdpRecovery(() =>
+        this.cdp.evaluate(
+          `(() => {
+            const channel = new MessageChannel();
+            globalThis.__workbuddyRemoteDaemon.setup(${socketId}, channel.port1);
+            window.postMessage({
+              type: "workbuddy:open-local-daemon-transport-port",
+              target: { transportType: "local" },
+            }, "*", [channel.port2]);
+            return true;
+          })()`
+        )
+      );
+    } catch (error) {
+      this.daemonSockets.delete(socketId);
+      logger.error("daemon_transport.handover_failed", "Failed to hand daemon port to WorkBuddy", {
+        socketId,
+        error,
+      });
+      try { socket.close(1011, "daemon handover failed"); } catch {}
+      return;
+    }
+
+    socket.on("message", (raw) => {
+      const text = raw.toString();
+      this.withCdpRecovery(() =>
+        this.cdp.evaluate(
+          `globalThis.__workbuddyRemoteDaemon.recv(${socketId}, ${JSON.stringify(text)})`
+        )
+      ).catch((error) => {
+        logger.warn("daemon_transport.forward_error", "Failed to forward daemon frame into WorkBuddy", {
+          socketId,
+          error,
+        });
+      });
+    });
+
+    const cleanup = async () => {
+      if (!this.daemonSockets.has(socketId)) {
+        return;
+      }
+      this.daemonSockets.delete(socketId);
+      try {
+        await this.cdp.evaluate(`globalThis.__workbuddyRemoteDaemon.close(${socketId})`);
+      } catch {}
+      logger.info("daemon_transport.socket.closed", "Browser daemon transport socket closed", {
+        socketId,
+        daemonSocketCount: this.daemonSockets.size,
+      });
+    };
+    socket.on("close", () => {
+      cleanup().catch(() => {});
+    });
+    socket.on("error", () => {
+      cleanup().catch(() => {});
+    });
+  }
+
+  async invokeWbIpc(channel, context, args) {
+    return this.withCdpRecovery(async () => {
+      const rawContext = JSON.stringify(context === undefined ? null : context);
+      const rawArgs = JSON.stringify(args || []);
+      const envelope = await this.cdp.evaluate(
+        `globalThis.__workbuddyBridge.callWbInvoke(${JSON.stringify(channel)}, ${rawContext}, ${rawArgs})`,
+        { timeoutMs: WORKBUDDY_RPC_DEFAULT_TIMEOUT_MS }
+      );
+      return unwrapTransportPayload(
+        await this.readBuddyApiResultEnvelope(envelope, WORKBUDDY_RPC_DEFAULT_TIMEOUT_MS, {
+          method: `wbInvoke:${channel}`,
+        })
+      );
+    });
+  }
+
+  async subscribeWbEvent(channel, socket) {
+    const key = `wbOn:${channel}`;
+    const current = this.wbEventRefCounts.get(key);
+    if (!current) {
+      await this.withCdpRecovery(() =>
+        this.cdp.evaluate(`globalThis.__workbuddyBridge.subscribeWbEvent(${JSON.stringify(channel)})`)
+      );
+      this.wbEventRefCounts.set(key, { channel, count: 1 });
+    } else {
+      current.count += 1;
+    }
+
+    if (socket) {
+      if (!this.wbEventSocketSubs.has(socket)) {
+        this.wbEventSocketSubs.set(socket, new Map());
+      }
+      const subs = this.wbEventSocketSubs.get(socket);
+      subs.set(key, (subs.get(key) || 0) + 1);
+    }
+  }
+
+  async unsubscribeWbEvent(channel, socket = null) {
+    const key = `wbOn:${channel}`;
+    if (socket) {
+      const subs = this.wbEventSocketSubs.get(socket);
+      if (subs?.has(key)) {
+        const count = subs.get(key) - 1;
+        if (count <= 0) {
+          subs.delete(key);
+        } else {
+          subs.set(key, count);
+        }
+      }
+    }
+
+    const current = this.wbEventRefCounts.get(key);
+    if (!current) {
+      return;
+    }
+    current.count -= 1;
+    if (current.count <= 0) {
+      this.wbEventRefCounts.delete(key);
+      try {
+        await this.withCdpRecovery(() =>
+          this.cdp.evaluate(`globalThis.__workbuddyBridge.unsubscribeWbEvent(${JSON.stringify(channel)})`)
+        );
+      } catch (error) {
+        logger.warn("wb_event.unsubscribe_error", "Failed to unsubscribe wb-event in WorkBuddy", {
+          channel,
+          error,
+        });
+      }
+    }
+  }
+
+  async releaseWbEventSocket(socket) {
+    const subs = this.wbEventSocketSubs.get(socket);
+    this.wbEventSocketSubs.delete(socket);
+    if (!subs || subs.size === 0) {
+      return;
+    }
+    for (const key of subs.keys()) {
+      await this.unsubscribeWbEvent(key.slice("wbOn:".length), null);
+    }
+  }
+
   handleBridgeNotification(params) {
     let payload;
     try {
@@ -2020,6 +2287,24 @@ class BridgeRuntime {
     logger.debug("cdp.workbuddy_to_bridge", "WorkBuddy sent bridge notification", {
       payload: summarizeMessage(payload),
     });
+
+    if (payload.type === "daemon-frame") {
+      const daemonSocket = this.daemonSockets.get(payload.socketId);
+      if (daemonSocket) {
+        this.sendToSocket(daemonSocket, payload.data);
+      }
+      return;
+    }
+
+    if (payload.type === "wb-event") {
+      this.broadcast({ type: "wb-event", channel: payload.channel, args: payload.args });
+      return;
+    }
+
+    if (payload.type === "wb-event-all") {
+      this.broadcast({ type: "wb-event-all", event: payload.event, args: payload.args });
+      return;
+    }
 
     if (payload.type === "buddy-api-event") {
       this.broadcast(payload);

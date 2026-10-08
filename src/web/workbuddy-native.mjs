@@ -3778,6 +3778,33 @@ function renderWorkBuddyNativeShimJs({
       return;
     }
 
+    if (message.type === "wb-event") {
+      const wbArgs = (message.args || []).map(decodeTransport);
+      const wbCallbacks = wbEventListeners.get(message.channel);
+      if (wbCallbacks) {
+        for (const callback of [...wbCallbacks]) {
+          try {
+            callback(...wbArgs);
+          } catch (error) {
+            console.error("[workbuddy-remote] wb listener failed", error);
+          }
+        }
+      }
+      return;
+    }
+
+    if (message.type === "wb-event-all") {
+      const bridgeCallback = globalThis.__wbEventBridgeCallback;
+      if (typeof bridgeCallback === "function") {
+        try {
+          bridgeCallback(message.event, decodeTransport(message.args && message.args[0]));
+        } catch (error) {
+          console.error("[workbuddy-remote] wb event bridge callback failed", error);
+        }
+      }
+      return;
+    }
+
     if (message.type === "buddy-api-event") {
       const key = message.key || message.method;
       const args = (message.args || []).map(decodeTransport);
@@ -4249,6 +4276,133 @@ function renderWorkBuddyNativeShimJs({
   });
 
   globalThis.buddyAPI = buddyApi;
+
+  // ===== WorkBuddy desktop host stub (v37+ WebUI requires window.workbuddyDesktop) =====
+  if (!globalThis.workbuddyDesktop || typeof globalThis.workbuddyDesktop !== "object") {
+    globalThis.workbuddyDesktop = {
+      invoke() {
+        return Promise.resolve(undefined);
+      },
+      events: {
+        on() {
+          return () => {};
+        },
+      },
+    };
+  }
+
+  // ===== Daemon transport forwarder: relay MessagePort frames over /bridge/daemon =====
+  if (!globalThis.__workbuddyRemoteDaemonForwarderInstalled) {
+    globalThis.__workbuddyRemoteDaemonForwarderInstalled = true;
+    window.addEventListener("message", (event) => {
+      if (event.source !== window || !event.data || typeof event.data !== "object") {
+        return;
+      }
+      if (event.data.type !== "workbuddy:open-local-daemon-transport-port") {
+        return;
+      }
+      const port = event.ports[0];
+      if (!port) {
+        return;
+      }
+      const socketUrl =
+        (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/bridge/daemon";
+      let socket;
+      try {
+        socket = new WebSocket(socketUrl);
+      } catch (error) {
+        console.error("[workbuddy-remote] daemon socket create failed", error);
+        return;
+      }
+      const queued = [];
+      let socketOpen = false;
+      socket.onopen = () => {
+        socketOpen = true;
+        while (queued.length > 0) {
+          try {
+            socket.send(queued.shift());
+          } catch {}
+        }
+      };
+      socket.onmessage = (socketEvent) => {
+        try {
+          port.postMessage(JSON.parse(socketEvent.data));
+        } catch {}
+      };
+      socket.onclose = () => {
+        try {
+          port.postMessage({
+            sessionId: "",
+            kind: "close",
+            code: 1006,
+            reason: "bridge daemon socket closed",
+          });
+        } catch {}
+        try { port.close(); } catch {}
+      };
+      socket.onerror = () => {};
+      port.onmessage = (portEvent) => {
+        let raw;
+        try {
+          raw = JSON.stringify(portEvent.data);
+        } catch (error) {
+          console.error("[workbuddy-remote] daemon frame serialize failed", error);
+          return;
+        }
+        if (socketOpen) {
+          try {
+            socket.send(raw);
+          } catch {}
+        } else {
+          queued.push(raw);
+        }
+      };
+      try { port.start(); } catch {}
+    });
+  }
+
+  // ===== Desktop preload IPC surface (__wbInvoke / __wbOn) tunneled to the real WorkBuddy window =====
+  const wbEventListeners = new Map();
+  globalThis.__wbInvoke = async (channel, context, ...args) =>
+    request({
+      type: "wb-invoke",
+      channel,
+      context: context === undefined ? null : context,
+      args: await encodeValue(args),
+    });
+
+  globalThis.__wbEventBridge = (callback) => {
+    globalThis.__wbEventBridgeCallback = callback;
+    return () => {
+      if (globalThis.__wbEventBridgeCallback === callback) {
+        globalThis.__wbEventBridgeCallback = null;
+      }
+    };
+  };
+
+  globalThis.__wbOn = (channel, listener) => {
+    let callbacks = wbEventListeners.get(channel);
+    if (!callbacks) {
+      callbacks = new Set();
+      wbEventListeners.set(channel, callbacks);
+      request({ type: "wb-subscribe", channel }).catch((error) => {
+        console.error("[workbuddy-remote] wb subscribe failed", channel, error);
+      });
+    }
+    callbacks.add(listener);
+    return () => {
+      const current = wbEventListeners.get(channel);
+      if (!current) {
+        return;
+      }
+      current.delete(listener);
+      if (current.size === 0) {
+        wbEventListeners.delete(channel);
+        request({ type: "wb-unsubscribe", channel }).catch(() => {});
+      }
+    };
+  };
+
   installRemoteHistoryPagerScrollWatcher();
   globalThis.__WORKBUDDY_VERSION__ = workBuddyVersion;
   globalThis.__electronLog = globalThis.__electronLog || {

@@ -1485,6 +1485,36 @@ function attachWebSocketServer(server, runtime, auth) {
           return;
         }
 
+        if (message.type === "wb-invoke") {
+          const result = await runtime.invokeWbIpc(message.channel, message.context, message.args || []);
+          runtime.sendToSocket(socket, {
+            id: message.id,
+            ok: true,
+            result,
+          });
+          return;
+        }
+
+        if (message.type === "wb-subscribe") {
+          await runtime.subscribeWbEvent(message.channel, socket);
+          runtime.sendToSocket(socket, {
+            id: message.id,
+            ok: true,
+            result: true,
+          });
+          return;
+        }
+
+        if (message.type === "wb-unsubscribe") {
+          await runtime.unsubscribeWbEvent(message.channel, socket);
+          runtime.sendToSocket(socket, {
+            id: message.id,
+            ok: true,
+            result: true,
+          });
+          return;
+        }
+
         if (message.type === "restart-app") {
           if (!(await isRestartEnabled())) {
             throw new Error("Restart is disabled by config.");
@@ -1621,7 +1651,8 @@ function attachWebSocketServer(server, runtime, auth) {
 
   server.on("upgrade", (req, socket, head) => {
     const requestUrl = new URL(req.url || "/", "http://bridge.local");
-    if (requestUrl.pathname !== "/bridge/ws") {
+    const isDaemonSocket = requestUrl.pathname === "/bridge/daemon";
+    if (requestUrl.pathname !== "/bridge/ws" && !isDaemonSocket) {
       socket.destroy();
       return;
     }
@@ -1631,6 +1662,15 @@ function attachWebSocketServer(server, runtime, auth) {
     }
 
     wss.handleUpgrade(req, socket, head, (webSocket) => {
+      if (isDaemonSocket) {
+        runtime.handleDaemonSocket(webSocket).catch((error) => {
+          logger.error("websocket.daemon_upgrade_error", "Failed to initialize daemon transport socket", {
+            error,
+          });
+          try { webSocket.close(1011, "daemon transport init failed"); } catch {}
+        });
+        return;
+      }
       wss.emit("connection", webSocket, req);
     });
   });
