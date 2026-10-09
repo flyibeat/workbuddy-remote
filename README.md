@@ -83,14 +83,17 @@ powershell -ExecutionPolicy Bypass -File .\tools\start-workbuddy-remote.ps1 -Lis
   "bridgePort": 8780,
   "listenHost": "127.0.0.1",
   "killWorkBuddyProcessesBeforeStart": false,
-  "hideWorkBuddyWindowAfterStart": true,
+  "hideWorkBuddyWindowAfterStart": false,
+  "hideWorkBuddyMenuBar": false,
   "maskBridgeModelSecrets": true
 }
 ```
 
 `workbuddyExePath` 留空时会自动查找常见安装路径。
 
-`hideWorkBuddyWindowAfterStart` 设为 `true` 时，bridge 连接到 WorkBuddy 后会自动请求隐藏桌面窗口；WorkBuddy 进程和托盘仍保留，浏览器页面继续可用。
+`hideWorkBuddyWindowAfterStart` 设为 `true` 时，bridge 连接到 WorkBuddy 后会自动请求隐藏桌面窗口；WorkBuddy 进程和托盘仍保留，浏览器页面继续可用。默认 `false`，桌面窗口保持可见。
+
+`hideWorkBuddyMenuBar` 控制是否隐藏 WorkBuddy 的标题栏容器（含最小化 / 最大化 / 关闭按钮）。桌面版 WorkBuddy 是 `frame:false` 的自绘标题栏，窗口按钮画在网页里；一旦隐藏，按钮会整条消失，同时页面内容会上移 30px 压住侧栏品牌行（图标重合）。因此默认 `false`，即桌面窗口不做任何改动；关闭状态下 bridge 还会主动回滚历史注入的旧样式，让已经打开的桌面页恢复。只有在「远程控制台 / 无头截图」这类不需要桌面窗口的场景才建议设为 `true`，也可用命令行 `--hide-workbuddy-menubar` / `--keep-workbuddy-menubar` 临时覆盖（后者优先）。
 
 `maskBridgeModelSecrets` 设为 `true` 时，bridge 会先在服务端拦截模型配置读取结果，把接口地址 / Base URL 和 API Key 替换成占位值，再返回给浏览器；页面上也会继续把对应输入框显示为圆点。
 

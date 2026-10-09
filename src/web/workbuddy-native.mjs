@@ -2263,16 +2263,11 @@ function renderWorkBuddyNativeShimJs({
         overflow: hidden !important;
         pointer-events: none !important;
       }
-      #root {
-        margin-top: 0 !important;
-        height: 100vh !important;
-        min-height: 100vh !important;
-      }
-      .teams-container,
-      #root > .teams-container {
-        height: 100vh !important;
-        min-height: 100vh !important;
-      }
+      /* 不要覆盖 #root 的 margin-top / height：
+         宿主样式表 #workbuddy-desktop-layout-overrides 已为标题栏
+         (--wb-desktop-menubar-height: 30px) 留出空间；旧版在这里把
+         margin-top 归零、高度写成 100vh，会让侧栏内容上移 30px，
+         与左上角功能槽 (#workbuddy-titlebar-left-slot) 重叠。 */
     \`;
 
   function injectWorkBuddyMenuBarHiderStyle() {
@@ -2287,18 +2282,74 @@ function renderWorkBuddyNativeShimJs({
     }
   }
 
-  function hideWorkBuddyMenuBar() {
-    injectWorkBuddyMenuBarHiderStyle();
+  function restoreRootTopSpacing() {
+    // 旧版注入把 #root 的 margin-top 归零、高度写成 100vh，
+    // 造成侧栏顶部与左上功能槽重叠。这里只做「清理内联残留」，
+    // 不再写回任何值，让宿主样式表的
+    // margin-top: 30px / height: calc(100% - 30px) 生效。
     const root = document.getElementById("root");
     if (root) {
-      root.style.setProperty("margin-top", "0", "important");
-      root.style.setProperty("height", "100vh", "important");
-      root.style.setProperty("min-height", "100vh", "important");
+      root.style.removeProperty("margin-top");
+      root.style.removeProperty("height");
+      root.style.removeProperty("min-height");
     }
     for (const element of document.querySelectorAll(".teams-container")) {
-      element.style.setProperty("height", "100vh", "important");
-      element.style.setProperty("min-height", "100vh", "important");
+      element.style.removeProperty("height");
+      element.style.removeProperty("min-height");
     }
+  }
+
+  function ensureTitlebarLeftSlot() {
+    // 浏览器里没有 Electron 主进程，#workbuddy-titlebar-left-slot 不会由宿主创建。
+    // WorkBuddy 前端只会在挂载后轮询 30 帧等它出现；等不到就把
+    // .conversation-list-topbar-actions（侧栏收起/搜索/筛选）回落到侧栏顶栏，
+    // 绝对定位后压住「发现应用」按钮。这里尽早补出该槽，
+    // 让前端的 portal 能命中它，按桌面布局把三个按钮放进标题栏。
+    const attach = () => {
+      if (!document.body) {
+        return false;
+      }
+      if (!document.getElementById("workbuddy-titlebar-left-slot")) {
+        const slot = document.createElement("div");
+        slot.id = "workbuddy-titlebar-left-slot";
+        slot.dataset.wbBridgeSlot = "true";
+        document.body.appendChild(slot);
+      }
+      return true;
+    };
+    if (attach()) {
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      if (attach()) {
+        observer.disconnect();
+      }
+    });
+    observer.observe(document.documentElement || document, { childList: true, subtree: true });
+  }
+
+  function mountTopbarActionsIntoToolbar() {
+    // 浏览器里 #workbuddy-titlebar-left-slot 的 portal 未必命中（前端对宿主
+    // 契约的探测是有限次轮询），于是 .conversation-list-topbar-actions
+    // 会留在侧栏顶栏里、以 absolute 定位压在「发现应用」按钮上。
+    // 这里兜底搬进标题栏功能槽；宿主样式表里针对
+    // #workbuddy-titlebar-left-slot .conversation-list-topbar-actions
+    // 的规则会把它的定位改回常规流，图标自动排到左上角。
+    const slot = document.getElementById("workbuddy-titlebar-left-slot");
+    if (!slot) {
+      return false;
+    }
+    const actions = document.querySelector(".conversation-list-topbar-actions");
+    if (actions && actions.parentElement !== slot) {
+      slot.appendChild(actions);
+    }
+    return true;
+  }
+
+  function hideWorkBuddyMenuBar() {
+    injectWorkBuddyMenuBarHiderStyle();
+    restoreRootTopSpacing();
+    mountTopbarActionsIntoToolbar();
     for (const element of document.querySelectorAll("#workbuddy-menubar-container,.codebuddy-menubar,#workbuddy-window-controls-container,.workbuddy-window-controls")) {
       element.dataset.workbuddyRemoteMenuBarHidden = "true";
       element.style.setProperty("display", "none", "important");
@@ -2309,6 +2360,7 @@ function renderWorkBuddyNativeShimJs({
   }
 
   function installWorkBuddyMenuBarHider() {
+    ensureTitlebarLeftSlot();
     hideWorkBuddyMenuBar();
     if (workBuddyMenuBarObserver || !document.documentElement) {
       return;

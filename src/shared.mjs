@@ -1,7 +1,10 @@
 import os from "node:os";
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+
+const __sharedDirname = path.dirname(fileURLToPath(import.meta.url));
 
 const WORKSPACE_ROOT_FOLDER_NAME = "WBWorkspaces";
 const NO_STORE_CACHE_CONTROL = "no-store";
@@ -16,11 +19,31 @@ const DEFAULTS = {
   workbuddyPid: 0,
   openBrowser: false,
   hideWorkBuddyWindowAfterStart: false,
+  hideWorkBuddyMenuBar: false,
   logPath: "",
 };
 
+// 桌面窗口自绘标题栏（含最小化/最大化/关闭）默认必须保留，
+// 只有远程控制台/无头场景才隐藏，因此这里允许从 config 读开关，默认关。
+function readConfigMenuBarFlag() {
+  try {
+    const configPath = path.resolve(__sharedDirname, "..", "workbuddy-remote.config.json");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    const value = raw?.hideWorkBuddyMenuBar;
+    if (value === true || value === 1) {
+      return true;
+    }
+    if (typeof value === "string") {
+      return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function parseArgs(argv) {
-  const options = { ...DEFAULTS };
+  const options = { ...DEFAULTS, hideWorkBuddyMenuBar: readConfigMenuBarFlag() };
   for (let i = 0; i < argv.length; i += 1) {
     const current = argv[i];
     const next = argv[i + 1];
@@ -59,6 +82,12 @@ function parseArgs(argv) {
       case "--hide-workbuddy-window-after-start":
         options.hideWorkBuddyWindowAfterStart = true;
         break;
+      case "--hide-workbuddy-menubar":
+        options.hideWorkBuddyMenuBar = true;
+        break;
+      case "--keep-workbuddy-menubar":
+        options.hideWorkBuddyMenuBar = false;
+        break;
       case "--log-path":
         options.logPath = next || "";
         i += 1;
@@ -71,8 +100,20 @@ function parseArgs(argv) {
 }
 
 function resolveWorkBuddyExePath() {
+  // 允许通过 workbuddy-remote.config.json 的 workbuddyExePath 指定安装位置，
+  // 避免依赖外部环境变量（计划任务等无头环境下变量可能丢失）
+  let configExePath = "";
+  try {
+    const configPath = path.resolve(__sharedDirname, "..", "workbuddy-remote.config.json");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    if (typeof raw?.workbuddyExePath === "string" && raw.workbuddyExePath.trim()) {
+      configExePath = raw.workbuddyExePath.trim();
+    }
+  } catch {}
+
   const candidates = [
     process.env.WORKBUDDY_EXE_PATH,
+    configExePath,
     path.join(process.env.LOCALAPPDATA || "", "Programs", "WorkBuddy", "WorkBuddy.exe"),
     path.join(process.env.ProgramFiles || "", "WorkBuddy", "WorkBuddy.exe"),
     path.join(process.env["ProgramFiles(x86)"] || "", "WorkBuddy", "WorkBuddy.exe"),

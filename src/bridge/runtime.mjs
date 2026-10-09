@@ -443,10 +443,64 @@ class CdpClient {
     return response.result?.result?.value;
   }
 
-  async ensureBridgeInjected() {
+  // hideMenuBar 由 BridgeRuntime 传入（CdpClient 本身没有 options）。
+  async ensureBridgeInjected({ hideMenuBar = false } = {}) {
+    // 桌面窗口是 frame:false 的自绘标题栏（最小化/最大化/关闭都在网页里，占顶部 30px）。
+    // 隐藏标题栏容器会让窗口按钮整条消失，同时 #root 上移 30px 压住侧栏品牌行（图标重合）。
+    // 因此默认「桌面窗口不改动」，仅当 hideWorkBuddyMenuBar=true（远程控制台/无头场景，
+    // 配置 workbuddy-remote.config.json 或 CLI --hide-workbuddy-menubar）才注入；
+    // 关闭状态下会主动回滚历史注入，避免旧样式残留在已打开的桌面页上。
+    const menuBarHiderEnabled = hideMenuBar === true;
+    if (!this.menuBarHiderLogged) {
+      this.menuBarHiderLogged = true;
+      logger.info("cdp.menubar_hider", "Resolved WorkBuddy title-bar hider flag", {
+        enabled: menuBarHiderEnabled,
+      });
+    }
     await this.evaluate(
       `(() => {
         const workBuddyMenuBarHiderCss = "#workbuddy-menubar-container,.codebuddy-menubar,#workbuddy-window-controls-container,.workbuddy-window-controls{display:none!important;visibility:hidden!important;height:0!important;min-height:0!important;max-height:0!important;overflow:hidden!important;pointer-events:none!important;}#root{margin-top:0!important;height:100vh!important;min-height:100vh!important;}.teams-container,#root>.teams-container{height:100vh!important;min-height:100vh!important;}";
+
+        const hideWorkBuddyMenuBarEnabled = ${menuBarHiderEnabled ? "true" : "false"};
+
+        const restoreWorkBuddyMenuBar = () => {
+          try {
+            if (globalThis.__workbuddyRemoteMenuBarObserver) {
+              try { globalThis.__workbuddyRemoteMenuBarObserver.disconnect(); } catch {}
+              delete globalThis.__workbuddyRemoteMenuBarObserver;
+            }
+            const style = document.getElementById("wb-bridge-hide-menubar-style");
+            if (style && style.parentNode) {
+              style.parentNode.removeChild(style);
+            }
+            for (const element of document.querySelectorAll("[data-workbuddy-remote-menu-bar-hidden]")) {
+              delete element.dataset.workbuddyRemoteMenuBarHidden;
+              element.style.removeProperty("display");
+              element.style.removeProperty("visibility");
+              element.style.removeProperty("height");
+              element.style.removeProperty("pointer-events");
+            }
+            // 注意：早期版本只写内联 !important、没有打标记，
+            // 因此这里按「签名值」清理（内联里含 100vh 只可能是 hider 写的），
+            // 同时覆盖带标记与不带标记的历史残留。
+            const restoreViewportTarget = (element) => {
+              if (!element) return;
+              const inline = element.getAttribute("style") || "";
+              if (!/100vh/i.test(inline)) return;
+              delete element.dataset.workbuddyRemoteViewportPatched;
+              element.style.removeProperty("margin-top");
+              element.style.removeProperty("height");
+              element.style.removeProperty("min-height");
+            };
+            for (const element of document.querySelectorAll("[data-workbuddy-remote-viewport-patched]")) {
+              restoreViewportTarget(element);
+            }
+            restoreViewportTarget(document.getElementById("root"));
+            for (const element of document.querySelectorAll(".teams-container")) {
+              restoreViewportTarget(element);
+            }
+          } catch {}
+        };
 
         const hideWorkBuddyMenuBar = () => {
           try {
@@ -462,11 +516,13 @@ class CdpClient {
 
             const root = document.getElementById("root");
             if (root) {
+              root.dataset.workbuddyRemoteViewportPatched = "true";
               root.style.setProperty("margin-top", "0", "important");
               root.style.setProperty("height", "100vh", "important");
               root.style.setProperty("min-height", "100vh", "important");
             }
             for (const element of document.querySelectorAll(".teams-container")) {
+              element.dataset.workbuddyRemoteViewportPatched = "true";
               element.style.setProperty("height", "100vh", "important");
               element.style.setProperty("min-height", "100vh", "important");
             }
@@ -480,15 +536,19 @@ class CdpClient {
           } catch {}
         };
 
-        hideWorkBuddyMenuBar();
-        if (!globalThis.__workbuddyRemoteMenuBarObserver && typeof MutationObserver === "function") {
-          globalThis.__workbuddyRemoteMenuBarObserver = new MutationObserver(hideWorkBuddyMenuBar);
-          globalThis.__workbuddyRemoteMenuBarObserver.observe(document.documentElement, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ["id", "class"],
-          });
+        if (hideWorkBuddyMenuBarEnabled) {
+          hideWorkBuddyMenuBar();
+          if (!globalThis.__workbuddyRemoteMenuBarObserver && typeof MutationObserver === "function") {
+            globalThis.__workbuddyRemoteMenuBarObserver = new MutationObserver(hideWorkBuddyMenuBar);
+            globalThis.__workbuddyRemoteMenuBarObserver.observe(document.documentElement, {
+              childList: true,
+              subtree: true,
+              attributes: true,
+              attributeFilter: ["id", "class"],
+            });
+          }
+        } else {
+          restoreWorkBuddyMenuBar();
         }
 
         if (!globalThis.__workbuddyRemoteDaemon) {
@@ -1252,7 +1312,9 @@ class BridgeRuntime {
       }
 
       await this.cdp.connect();
-      await this.cdp.ensureBridgeInjected();
+      await this.cdp.ensureBridgeInjected({
+        hideMenuBar: this.options?.hideWorkBuddyMenuBar === true,
+      });
       this.hostBridgeKind = await this.cdp.evaluate(`globalThis.__workbuddyBridge.getHostKind()`);
       try {
         await this.cdp.evaluate(`globalThis.__workbuddyBridge.registerWbEventBridge()`);

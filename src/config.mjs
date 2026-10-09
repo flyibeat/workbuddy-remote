@@ -14,6 +14,7 @@ const DEFAULT_CONFIG = Object.freeze({
   listenHost: "127.0.0.1",
   killWorkBuddyProcessesBeforeStart: false,
   hideWorkBuddyWindowAfterStart: false,
+  hideWorkBuddyMenuBar: false,
   showReadyWindow: false,
   workspaceRoots: [],
   maskBridgeModelSecrets: false,
@@ -96,6 +97,10 @@ async function loadConfig() {
     hideWorkBuddyWindowAfterStart: normalizeBoolean(
       raw?.hideWorkBuddyWindowAfterStart,
       DEFAULT_CONFIG.hideWorkBuddyWindowAfterStart
+    ),
+    hideWorkBuddyMenuBar: normalizeBoolean(
+      raw?.hideWorkBuddyMenuBar,
+      DEFAULT_CONFIG.hideWorkBuddyMenuBar
     ),
     showReadyWindow: normalizeBoolean(
       raw?.showReadyWindow,
