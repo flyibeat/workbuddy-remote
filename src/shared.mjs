@@ -9,6 +9,47 @@ const __sharedDirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKSPACE_ROOT_FOLDER_NAME = "WBWorkspaces";
 const NO_STORE_CACHE_CONTROL = "no-store";
 
+// 从 workbuddy-remote.config.json 读取单个配置项（读不到/非法则回退）。
+// 计划任务无头启动时只能靠这个文件传参，因此后台自动重连相关开关也走这里。
+function readConfigRaw() {
+  try {
+    const configPath = path.resolve(__sharedDirname, "..", "workbuddy-remote.config.json");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function readConfigBoolean(key, fallback) {
+  const value = readConfigRaw()?.[key];
+  if (value === true || value === 1) {
+    return true;
+  }
+  if (value === false || value === 0) {
+    return false;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) {
+      return true;
+    }
+    if (["0", "false", "no", "off"].includes(normalized)) {
+      return false;
+    }
+  }
+  return fallback;
+}
+
+function readConfigPositiveNumber(key, fallback) {
+  const value = readConfigRaw()?.[key];
+  const parsed = typeof value === "number" ? value : Number(String(value ?? "").trim());
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.trunc(parsed);
+  }
+  return fallback;
+}
+
 const DEFAULTS = {
   cdpHost: "127.0.0.1",
   cdpPort: 9333,
@@ -21,25 +62,18 @@ const DEFAULTS = {
   hideWorkBuddyWindowAfterStart: false,
   hideWorkBuddyMenuBar: false,
   logPath: "",
+  // 后台自动重连：桌面重启（自动更新、手动开关）后无需任何人工操作，
+  // 桥接自己重新挂载到桌面渲染进程。可在 config.json 覆盖。
+  autoReconnect: readConfigBoolean("autoReconnect", true),
+  reconnectIntervalMs: readConfigPositiveNumber("reconnectIntervalMs", 10000),
+  reconnectProbeIntervalMs: readConfigPositiveNumber("reconnectProbeIntervalMs", 60000),
+  reconnectTargetTimeoutMs: readConfigPositiveNumber("reconnectTargetTimeoutMs", 5000),
 };
 
 // 桌面窗口自绘标题栏（含最小化/最大化/关闭）默认必须保留，
 // 只有远程控制台/无头场景才隐藏，因此这里允许从 config 读开关，默认关。
 function readConfigMenuBarFlag() {
-  try {
-    const configPath = path.resolve(__sharedDirname, "..", "workbuddy-remote.config.json");
-    const raw = JSON.parse(readFileSync(configPath, "utf8"));
-    const value = raw?.hideWorkBuddyMenuBar;
-    if (value === true || value === 1) {
-      return true;
-    }
-    if (typeof value === "string") {
-      return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
-    }
-    return false;
-  } catch {
-    return false;
-  }
+  return readConfigBoolean("hideWorkBuddyMenuBar", false);
 }
 
 function parseArgs(argv) {
@@ -87,6 +121,16 @@ function parseArgs(argv) {
         break;
       case "--keep-workbuddy-menubar":
         options.hideWorkBuddyMenuBar = false;
+        break;
+      case "--no-auto-reconnect":
+        options.autoReconnect = false;
+        break;
+      case "--auto-reconnect":
+        options.autoReconnect = true;
+        break;
+      case "--reconnect-interval-ms":
+        options.reconnectIntervalMs = Number(next) || options.reconnectIntervalMs;
+        i += 1;
         break;
       case "--log-path":
         options.logPath = next || "";

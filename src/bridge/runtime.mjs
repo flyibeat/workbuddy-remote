@@ -1218,6 +1218,11 @@ class BridgeRuntime {
     this.daemonSocketSeq = 0;
     this.wbEventRefCounts = new Map();
     this.wbEventSocketSubs = new Map();
+    // 后台自动重连（supervisor）状态
+    this.supervisorTimer = null;
+    this.supervisorBusy = false;
+    this.supervisorDetachedTicks = 0;
+    this.lastHostProbeAt = 0;
   }
 
   async initialize() {
@@ -1239,6 +1244,117 @@ class BridgeRuntime {
 
   isHostConnected() {
     return this.cdp?.ws?.readyState === WebSocket.OPEN && Boolean(this.targetUrl);
+  }
+
+  // 后台自动重连（supervisor）：桥接不再依赖外部请求，自己周期性确认与桌面的挂载关系。
+  // - 已失联：用短超时重新发现 target 并挂载 => 桌面重启（自动更新/手动开关）后自动接回，
+  //   不需要人工重启桥接、也不需要看门狗。
+  // - 已连接：低频"深探"（读一次页面注入版本号），识别桌面卡死/窗口关闭留下的假连接，
+  //   发现异常即强制重新挂载，让 /readyz 反映真实状态。
+  startSupervisor() {
+    if (this.options?.autoReconnect === false || this.supervisorTimer) {
+      return false;
+    }
+
+    const intervalMs = Math.max(2000, Number(this.options?.reconnectIntervalMs) || 10000);
+    this.supervisorTimer = setInterval(() => {
+      void this.#runSupervisorTick();
+    }, intervalMs);
+    if (typeof this.supervisorTimer.unref === "function") {
+      this.supervisorTimer.unref();
+    }
+
+    logger.info("runtime.supervisor.started", "Background auto-reconnect supervisor started", {
+      intervalMs,
+      probeIntervalMs: this.#hostProbeIntervalMs(),
+      targetTimeoutMs: this.#supervisorTargetTimeoutMs(),
+    });
+    return true;
+  }
+
+  stopSupervisor() {
+    if (!this.supervisorTimer) {
+      return;
+    }
+
+    clearInterval(this.supervisorTimer);
+    this.supervisorTimer = null;
+    logger.info("runtime.supervisor.stopped", "Background auto-reconnect supervisor stopped");
+  }
+
+  #hostProbeIntervalMs() {
+    return Math.max(5000, Number(this.options?.reconnectProbeIntervalMs) || 60000);
+  }
+
+  #supervisorTargetTimeoutMs() {
+    return Math.max(1000, Number(this.options?.reconnectTargetTimeoutMs) || 5000);
+  }
+
+  async #runSupervisorTick() {
+    if (this.supervisorBusy) {
+      return;
+    }
+
+    this.supervisorBusy = true;
+    try {
+      if (!this.isHostConnected()) {
+        await this.#reattachFromSupervisor();
+        return;
+      }
+      await this.#probeHostFromSupervisor();
+    } catch (error) {
+      logger.warn("runtime.supervisor.tick_error", "Auto-reconnect supervisor tick failed", { error });
+    } finally {
+      this.supervisorBusy = false;
+    }
+  }
+
+  async #reattachFromSupervisor() {
+    this.supervisorDetachedTicks += 1;
+    const attempts = this.supervisorDetachedTicks;
+
+    try {
+      await this.ensureCdpReady({
+        forceRefresh: true,
+        targetTimeoutMs: this.#supervisorTargetTimeoutMs(),
+      });
+      this.supervisorDetachedTicks = 0;
+      logger.info("runtime.supervisor.reattached", "Re-attached to WorkBuddy desktop automatically", {
+        attempts,
+      });
+    } catch (error) {
+      // 桌面不在（未启动 / 未带 --remote-debugging-port 启动）时保持静默重试，
+      // 只在首次与每 6 次记录一次，避免日志刷屏。
+      if (attempts === 1 || attempts % 6 === 0) {
+        logger.warn("runtime.supervisor.attach_pending", "WorkBuddy renderer target is not available yet", {
+          attempts,
+          error,
+        });
+      }
+    }
+  }
+
+  async #probeHostFromSupervisor() {
+    const now = Date.now();
+    if (now - this.lastHostProbeAt < this.#hostProbeIntervalMs()) {
+      return;
+    }
+    this.lastHostProbeAt = now;
+
+    try {
+      const version = await this.cdp.evaluate(
+        "globalThis.__workbuddyBridge && globalThis.__workbuddyBridge.__workbuddyRemoteVersion ? globalThis.__workbuddyBridge.__workbuddyRemoteVersion : 0",
+        { timeoutMs: 5000 }
+      );
+      if (!version) {
+        throw new Error("WorkBuddy page bridge injection is missing");
+      }
+    } catch (error) {
+      logger.warn("runtime.supervisor.host_probe_failed", "Host page probe failed, forcing re-attach", {
+        error,
+      });
+      await this.#reattachFromSupervisor();
+    }
   }
 
   async getWorkspaceContextCandidates() {
@@ -1277,7 +1393,7 @@ class BridgeRuntime {
     });
   }
 
-  async ensureCdpReady({ forceRefresh = false } = {}) {
+  async ensureCdpReady({ forceRefresh = false, targetTimeoutMs = 0 } = {}) {
     if (this.reconnectPromise) {
       await this.reconnectPromise;
       return;
@@ -1293,7 +1409,10 @@ class BridgeRuntime {
     }
 
     this.reconnectPromise = (async () => {
-      const target = await getWorkBuddyTarget(this.options);
+      const targetOptions = Number.isFinite(targetTimeoutMs) && targetTimeoutMs > 0
+        ? { ...this.options, targetTimeoutMs }
+        : this.options;
+      const target = await getWorkBuddyTarget(targetOptions);
       const previousTargetUrl = this.targetUrl;
       const shouldReplaceClient =
         forceRefresh ||

@@ -68,6 +68,12 @@ async function main() {
   const runtime = new BridgeRuntime(options);
   const server = await startBridgeServer(runtime, options);
   activeResources.push(server);
+  if (runtime.startSupervisor()) {
+    logger.info("bridge.supervisor", "Auto-reconnect supervisor is active", {
+      autoReconnect: options.autoReconnect !== false,
+      reconnectIntervalMs: options.reconnectIntervalMs,
+    });
+  }
   runtime.warmup().catch((error) => {
     logger.warn("bridge.warmup.error", "Bridge warmup failed", { error });
   });
