@@ -2381,6 +2381,17 @@ function renderWorkBuddyNativeShimJs({
     if (element.closest?.("#wb-bridge-file-manager-overlay")) {
       return false;
     }
+    // 应用内元素不是窗口控制按钮，禁止误伤：
+    // 产物/详情面板的标签栏就长在标题栏正下方的顶部轨道里（top 约 30~66），
+    // 且面板本身是最右列，几何上与窗口控制按钮完全重叠；
+    // 标签上的关闭按钮 button.artifact-tab__close[aria-label="关闭"] 因此被误隐藏。
+    if (
+      element.closest?.(
+        ".artifact-tabs,.sidebar-next-main-header,.sidebar-next-body,.detail-panel,[class*='__close']"
+      )
+    ) {
+      return false;
+    }
     const label = [
       element.getAttribute?.("aria-label"),
       element.getAttribute?.("title"),
@@ -2397,7 +2408,10 @@ function renderWorkBuddyNativeShimJs({
     if (!rect || rect.width <= 0 || rect.height <= 0) {
       return false;
     }
-    return rect.top <= 72 && window.innerWidth - rect.right <= 220;
+    // 标题栏真实高度只有 30px：阈值收到 36px。
+    // 原来的 72px（= 30px 标题栏 + 36px 顶部轨道 + 余量）会把顶部轨道里的
+    // 面板按钮一并吞掉，表现为「web 端产物标签没有关闭按钮」。
+    return rect.top <= 36 && window.innerWidth - rect.right <= 220;
   }
 
   function hideBrowserWindowControls() {

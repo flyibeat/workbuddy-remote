@@ -4,13 +4,9 @@ output/
 secrets/
 *.bak-*
 
-# 本机运维 / 调试脚本（含本机路径，只在本机使用，不入库）
+# 本机运维脚本（含本机路径，只在本机使用，不入库）
 start-bridge.ps1
 start-bridge-task.vbs
-tools/asar-lines.mjs
 tools/bridge-launch.mjs
 tools/bridge-live-check.mjs
-tools/daemon-*.mjs
-tools/event-bridge-check.mjs
 tools/fix-bridge-task.ps1
-tools/ui-click-check.mjs
