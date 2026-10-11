@@ -62,6 +62,32 @@ function renderWorkBuddyNativeShimJs({
 } = {}) {
   const methodList = [...new Set([...FALLBACK_BUDDY_API_METHODS, ...methods])];
   return `(() => {
+  // ── 平台判定统一成 Windows，让浏览器里的页面与 PC 浏览器一致 ─────────────
+  // 远程 web 端本来就是 Windows 桌面端的浏览器镜像（桥接口令登录后，原生接口
+  // 报的平台就是 win32）。但 iPadOS 走的是桌面级 UA，navigator.platform 返回
+  // MacIntel，WorkBuddy 的桌面宿主据此把 body[data-platform] 设成 mac，并且
+  // 按这个平台现场生成布局样式，于是：
+  //   1) --wb-desktop-menubar-height 变成 0，页面顶部不再留标题栏空间；
+  //   2) 唯一的槽位定位规则
+  //      body[data-platform="windows"] #workbuddy-titlebar-left-slot{position:fixed;...}
+  //      失效；
+  // 结果：侧栏顶栏那三个按钮（收起侧边栏 / 搜索 / 筛选）被放进一个没有任何
+  // 定位的 body 末级槽位，作为普通块级内容掉到页面最底部。
+  // 宿主的样式是它自己按 navigator.platform 生成后写进 style 标签的，事后改
+  // body 属性救不回来；所以必须在本脚本里（它先于应用 bundle 执行）就把平台
+  // 判定固定成 win，才能让宿主走 Windows 分支、把标题栏带与槽位一起做出来。
+  try {
+    if (!/win/i.test(String(navigator.platform || ""))) {
+      Object.defineProperty(navigator, "platform", {
+        configurable: true,
+        get() {
+          return "Win32";
+        },
+      });
+    }
+  } catch (error) {
+    // 覆盖失败时保持原平台：只会少一条标题栏，不影响功能
+  }
   const apiMethods = ${JSON.stringify(methodList)};
   const workBuddyVersion = ${JSON.stringify(version || "")};
   const workBuddyLocale = ${JSON.stringify(locale || "")};
