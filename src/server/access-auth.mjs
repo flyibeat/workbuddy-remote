@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-import { json, text } from "../shared.mjs";
+import { json, readConfigPositiveNumber, text } from "../shared.mjs";
 import { validatePasswordHashFormat, verifyPasswordHash } from "./password-hash.mjs";
 
 const LOGIN_PATH = "/login";
@@ -8,6 +8,29 @@ const LOGOUT_PATH = "/logout";
 const SESSION_COOKIE_NAME = "workbuddy_remote_session";
 const SESSION_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+
+// 登录失败限速。这是「反代层不再承担认证」时桥接自带口令的最后一道门：
+// 没有它，单口令可以在线无限次尝试。参数优先读 workbuddy-remote.config.json
+// （loginMaxFailures / loginWindowMs / loginLockoutMs），其次读同名环境变量，最后用默认值。
+function readPositiveIntEnv(name) {
+  const parsed = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+const LOGIN_THROTTLE = {
+  maxFailures: readConfigPositiveNumber(
+    "loginMaxFailures",
+    readPositiveIntEnv("WORKBUDDY_REMOTE_LOGIN_MAX_FAILURES") || 10
+  ),
+  windowMs: readConfigPositiveNumber(
+    "loginWindowMs",
+    readPositiveIntEnv("WORKBUDDY_REMOTE_LOGIN_WINDOW_MS") || 10 * 60 * 1000
+  ),
+  lockoutMs: readConfigPositiveNumber(
+    "loginLockoutMs",
+    readPositiveIntEnv("WORKBUDDY_REMOTE_LOGIN_LOCKOUT_MS") || 10 * 60 * 1000
+  ),
+};
 
 function getLoginPageStrings(locale) {
   const normalizedLocale = String(
@@ -23,6 +46,7 @@ function getLoginPageStrings(locale) {
       passwordLabel: "密码",
       continueLabel: "继续",
       incorrectPassword: "密码不正确。",
+      tooManyAttempts: "登录尝试过于频繁，请稍后再试。",
     };
   }
 
@@ -34,6 +58,7 @@ function getLoginPageStrings(locale) {
     passwordLabel: "Password",
     continueLabel: "Continue",
     incorrectPassword: "Password is incorrect.",
+    tooManyAttempts: "Too many failed attempts. Please try again later.",
   };
 }
 
@@ -66,6 +91,25 @@ function parseCookies(cookieHeader) {
     }
   }
   return cookies;
+}
+
+// 限速键：桥接只监听回环、前置必是同机反代，因此 socket.remoteAddress 恒为 127.0.0.1，
+// 必须优先取反代写入的转发头；两者都没有时退化为同一个键，等价于「全局限速」（更保守）。
+function getClientKey(req) {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  const forwardedValue = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
+  const firstForwarded = typeof forwardedValue === "string" ? forwardedValue.split(",")[0].trim() : "";
+  if (firstForwarded) {
+    return firstForwarded;
+  }
+
+  const realIp = req.headers["x-real-ip"];
+  const realIpValue = Array.isArray(realIp) ? realIp[0] : realIp;
+  if (typeof realIpValue === "string" && realIpValue.trim()) {
+    return realIpValue.trim();
+  }
+
+  return req.socket?.remoteAddress || "unknown";
 }
 
 function readUtf8Body(req) {
@@ -239,6 +283,7 @@ class BridgeAccessAuth {
   constructor(passwordHash) {
     this.passwordHash = validatePasswordHashFormat(passwordHash);
     this.sessions = new Map();
+    this.loginAttempts = new Map();
     this.lastCleanupAt = 0;
   }
 
@@ -328,6 +373,42 @@ class BridgeAccessAuth {
     return false;
   }
 
+  getLoginLock(clientKey) {
+    const entry = this.loginAttempts.get(clientKey);
+    if (!entry) {
+      return { locked: false, retryAfterMs: 0 };
+    }
+
+    const now = Date.now();
+    if (entry.lockedUntil > now) {
+      return { locked: true, retryAfterMs: entry.lockedUntil - now };
+    }
+
+    if (now - entry.firstAt > LOGIN_THROTTLE.windowMs) {
+      this.loginAttempts.delete(clientKey);
+    }
+    return { locked: false, retryAfterMs: 0 };
+  }
+
+  registerLoginFailure(clientKey) {
+    const now = Date.now();
+    const previous = this.loginAttempts.get(clientKey);
+    const entry =
+      previous && now - previous.firstAt <= LOGIN_THROTTLE.windowMs
+        ? previous
+        : { count: 0, firstAt: now, lockedUntil: 0 };
+
+    entry.count += 1;
+    if (entry.count >= LOGIN_THROTTLE.maxFailures) {
+      entry.lockedUntil = now + LOGIN_THROTTLE.lockoutMs;
+    }
+    this.loginAttempts.set(clientKey, entry);
+  }
+
+  clearLoginFailures(clientKey) {
+    this.loginAttempts.delete(clientKey);
+  }
+
   async handleLoginRoute(req, res, requestUrl) {
     const locale = getRequestLocale(req);
     const strings = getLoginPageStrings(locale);
@@ -359,12 +440,35 @@ class BridgeAccessAuth {
       return;
     }
 
+    const clientKey = getClientKey(req);
+    const lock = this.getLoginLock(clientKey);
+    if (lock.locked) {
+      const retryAfterSeconds = Math.max(1, Math.ceil(lock.retryAfterMs / 1000));
+      const lockedBody = Buffer.from(
+        renderLoginPage({
+          locale,
+          errorMessage: strings.tooManyAttempts,
+          nextPath: normalizeNextPath(requestUrl.searchParams.get("next")),
+        }),
+        "utf8"
+      );
+      res.writeHead(429, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Length": lockedBody.byteLength,
+        "Retry-After": String(retryAfterSeconds),
+      });
+      res.end(lockedBody);
+      return;
+    }
+
     const body = await readUtf8Body(req);
     const formData = new URLSearchParams(body);
     const password = formData.get("password") || "";
     const nextPath = normalizeNextPath(formData.get("next") || requestUrl.searchParams.get("next"));
 
     if (!verifyPasswordHash(password, this.passwordHash.rawValue)) {
+      this.registerLoginFailure(clientKey);
       text(
         res,
         401,
@@ -378,6 +482,7 @@ class BridgeAccessAuth {
       return;
     }
 
+    this.clearLoginFailures(clientKey);
     const token = crypto.randomBytes(32).toString("hex");
     this.sessions.set(token, Date.now() + SESSION_TTL_MS);
     this.cleanupExpiredSessions();
@@ -415,6 +520,15 @@ class BridgeAccessAuth {
         this.sessions.delete(token);
       }
     }
+
+    for (const [clientKey, entry] of this.loginAttempts.entries()) {
+      const lockExpired = entry.lockedUntil > 0 && entry.lockedUntil <= now;
+      const windowExpired = now - entry.firstAt > LOGIN_THROTTLE.windowMs;
+      if (lockExpired || windowExpired) {
+        this.loginAttempts.delete(clientKey);
+      }
+    }
+
     this.lastCleanupAt = now;
   }
 }

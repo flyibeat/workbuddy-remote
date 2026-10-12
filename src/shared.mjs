@@ -311,6 +311,7 @@ export {
   getLanUrls,
   json,
   parseArgs,
+  readConfigPositiveNumber,
   readJsonBody,
   resolveWorkBuddyAsarPath,
   resolveWorkBuddyExePath,

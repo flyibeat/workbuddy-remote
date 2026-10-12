@@ -2484,6 +2484,11 @@ function renderWorkBuddyNativeShimJs({
       .join(" ");
   }
 
+  const touchModelSelectorSplit = {
+    installed: false,
+    pending: null,
+  };
+
   const mobileNavigationAssist = {
     installed: false,
     hitTarget: null,
@@ -3100,12 +3105,112 @@ function renderWorkBuddyNativeShimJs({
     }
   }
 
+  function ensureTouchComfortStyleSheet() {
+    const styleId = "wb-bridge-touch-comfort";
+    if (document.getElementById(styleId)) {
+      return;
+    }
+    // 整段规则用 (hover: none) and (pointer: coarse) 门控：只有触屏设备命中。
+    // 电脑键鼠（hover:hover / pointer:fine）完全不匹配，桌面 exe 也不加载本 shim，
+    // 因此对键鼠交互与 exe 零影响。
+    // 1) 置顶任务：拖拽库把 .conversation-pinned-drag-item 内联写死 touch-action:none，
+    //    触屏手指按住它时纵向手势被吞成拖拽/选择、滑不动 → 覆盖为 pan-y 恢复滚动，
+    //    并关掉长按弹层与文字选择。
+    // 2) 模型下拉的列表行 / 思考程度子面板行命中区太小（原生 32px）→ 放大到 44px，
+    //    去掉双击缩放延迟，面板本身可纵向惯性滚动。
+    const style = document.createElement("style");
+    style.id = styleId;
+    style.textContent = "@media (hover: none) and (pointer: coarse) { .conversation-pinned-drag-item { touch-action: pan-y !important; -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; } .conversation-list, .conversation-list-content, .conversation-pinned-list { -webkit-touch-callout: none; } .conversation-list-content, .cr-message-list { touch-action: pan-y; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; } .cr-model-selector__item, .cr-model-selector__group-entry, .cr-model-selector__sub-menu-action, .cr-model-selector__sub-menu-header, .cr-model-selector__sub-panel-item, .cr-model-selector__sub-panel-toggle, .cr-model-selector__sub-panel-section-label { min-height: 44px; touch-action: manipulation; -webkit-tap-highlight-color: transparent; } .cr-model-selector__sub-panel-item, .cr-model-selector__sub-panel-toggle { padding: 10px 14px; } .cr-model-selector__list, .cr-model-selector__sub-menu, .cr-model-selector__sub-panel { max-height: 68vh; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; } }";
+    (document.head || document.documentElement || document.body)?.appendChild(style);
+  }
+
+  function isTouchCoarseViewport() {
+    try {
+      return !!(window.matchMedia && window.matchMedia("(hover: none) and (pointer: coarse)").matches);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  // 模型选择器「点选与查看分离」：仅触屏。
+  // 根因（源码）：可展开的模型行 m 被悬停浮层组件 HV 包裹，HV 在 pointerdown(touch) 时展开
+  // 右侧详情面板（思考程度等），但同一触摸的 click 又会命中 m 的 onClick 直接选中模型并关闭整个下拉，
+  // 于是「点一下模型就选好了」，永远够不到二级面板。
+  // 做法：document 捕获阶段监听。pointerdown 记录该行的 HV 触发容器此刻是否已展开(wasOpen)，
+  // click(在 React 冒泡 onClick 之前) 时再读一次：仅当「本次触摸前未展开、本次触摸后已展开」
+  // 才判定为「这一次点击是用来展开详情的」，于是拦掉那次误触发的选中。
+  // 普通(不可展开)行没有 HV 容器，nowOpen 恒为 false，不拦，选中照常；
+  // 详情已展开时再点同一行 = 确认选中，wasOpen/nowOpen 均 true，不拦；
+  // 手指拖动滚动（位移超阈值）不拦。整块用 coarse pointer + pointerType==="touch" 双重门控，
+  // PC 键鼠与 exe（不加载本 shim）零影响。
+  function installTouchModelSelectorSplit() {
+    if (touchModelSelectorSplit.installed) {
+      return;
+    }
+    touchModelSelectorSplit.installed = true;
+    // HV 展开时会在包裹模型行的触发 div 上写 data-submenu-open="true"（源码字面量），
+    // 该行是其子节点，故用 closest 判断"这一行的二级面板是否处于展开态"即可，无需定位包装层。
+    const OPEN_SEL = '[data-submenu-open="true"]';
+    const ITEM_SEL = ".cr-model-selector__item";
+
+    function submenuOpenFor(item) {
+      return Boolean(item && item.closest && item.closest(OPEN_SEL));
+    }
+
+    document.addEventListener("pointerdown", (event) => {
+      if (event.pointerType !== "touch" || !isTouchCoarseViewport()) {
+        touchModelSelectorSplit.pending = null;
+        return;
+      }
+      const target = event.target;
+      const item = target && target.closest ? target.closest(ITEM_SEL) : null;
+      // 详情子面板内（思考程度选项等）的点击交给原生 onClick 生效，不纳入分离逻辑。
+      if (!item || target.closest("[data-cr-submenu-overlay], [data-cr-sub-menu-overlay]")) {
+        touchModelSelectorSplit.pending = null;
+        return;
+      }
+      touchModelSelectorSplit.pending = {
+        item: item,
+        wasOpen: submenuOpenFor(item),
+        x: event.clientX,
+        y: event.clientY,
+        time: Date.now(),
+      };
+    }, true);
+
+    document.addEventListener("click", (event) => {
+      const pending = touchModelSelectorSplit.pending;
+      touchModelSelectorSplit.pending = null;
+      if (!pending) {
+        return;
+      }
+      const target = event.target;
+      const item = target && target.closest ? target.closest(ITEM_SEL) : null;
+      // 只处理同一次触摸、同一行、时间极短、几乎没拖动的那一下。
+      if (!item || item !== pending.item || Date.now() - pending.time > 700) {
+        return;
+      }
+      if (Math.hypot(event.clientX - pending.x, event.clientY - pending.y) > 12) {
+        return;
+      }
+      // 本次触摸把二级面板从「关」变「开」→ 意图是展开查看，拦掉随之而来的误选中。
+      // React 18 离散事件下 pointerdown 里的 setState 同步 flush，click 时属性已进 DOM；
+      // 即便该假设偶发失效，条件不成立 → 退回"点即选中"旧行为，不会更糟（fail-safe）。
+      if (!pending.wasOpen && submenuOpenFor(item)) {
+        event.stopPropagation();
+        event.preventDefault();
+      }
+    }, true);
+  }
+
   function installMobileNavigationAssist() {
     if (mobileNavigationAssist.installed) {
       return;
     }
     mobileNavigationAssist.installed = true;
     ensureMobileNavigationStyleSheet();
+    ensureTouchComfortStyleSheet();
+    installTouchModelSelectorSplit();
     scheduleMobileNavigationRefresh();
 
     document.addEventListener("touchstart", startTopBarTapRescue, { capture: true, passive: true });
